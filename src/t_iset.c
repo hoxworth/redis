@@ -146,8 +146,7 @@ void avlUpdateMaxScores(avlNode *locNode) {
             oldNodeMax = locNode->left->scores[1];
             oldNodeMax = (oldNodeMax > locNode->left->subLeftMax) ? oldNodeMax : locNode->left->subLeftMax;
             oldNodeMax = (oldNodeMax > locNode->left->subRightMax) ? oldNodeMax : locNode->left->subRightMax;
-            if (locNode->subLeftMax < oldNodeMax)
-                locNode->subLeftMax = oldNodeMax;
+            locNode->subLeftMax = oldNodeMax;
         }
         else {
             locNode->subLeftMax = -INFINITY;
@@ -156,8 +155,7 @@ void avlUpdateMaxScores(avlNode *locNode) {
             oldNodeMax = locNode->right->scores[1];
             oldNodeMax = (oldNodeMax > locNode->right->subLeftMax) ? oldNodeMax : locNode->right->subLeftMax;
             oldNodeMax = (oldNodeMax > locNode->right->subRightMax) ? oldNodeMax : locNode->right->subRightMax;
-            if (locNode->subRightMax < oldNodeMax)
-                locNode->subRightMax = oldNodeMax;
+            locNode->subRightMax = oldNodeMax;
         }
         else {
             locNode->subRightMax = -INFINITY;
@@ -391,6 +389,7 @@ int avlRemoveNode(avl * tree, avlNode *locNode, avlNode *delNode, char freeNodeM
                     return -1;
                 }
                 avlRemoveFromParent(tree,locNode,locNode->right);
+                locNode->right->parent = locNode->parent;
                 if (locNode->parent)
                     avlUpdateMaxScores(locNode->parent);
                 locNode->right = NULL;
@@ -401,6 +400,7 @@ int avlRemoveNode(avl * tree, avlNode *locNode, avlNode *delNode, char freeNodeM
             }
             if (!locNode->right) {
                 avlRemoveFromParent(tree,locNode,locNode->left);
+                locNode->left->parent = locNode->parent;
                 if (locNode->parent)
                     avlUpdateMaxScores(locNode->parent);
                 locNode->left = NULL;
@@ -425,14 +425,32 @@ int avlRemoveNode(avl * tree, avlNode *locNode, avlNode *delNode, char freeNodeM
             }
 
             // Remove the replacementNode from the tree
-            heightDelta = avlRemoveNode(tree, locNode,replacementNode,0,NULL);
+            heightDelta = avlRemoveNode(tree, locNode,replacementNode,0,removed);
+
+            //if the replacement node is a direct child of locNode,
+            //don't set it up to point to itself
+            if (locNode->right) locNode->right->parent = replacementNode;
+            if (locNode->left)  locNode->left->parent = replacementNode;
+
             replacementNode->left = locNode->left;
             replacementNode->right = locNode->right;
-            locNode->right->parent = replacementNode;
-            locNode->left->parent = replacementNode;
+            replacementNode->parent = locNode->parent;
             replacementNode->balance = locNode->balance;
-            if (locNode->parent)
+
+            //Now replace the tree's root with replacementNode if it's the root
+            //otherwise place the replacement under the parent
+            if (locNode == tree->root) {
+                avlUpdateMaxScores(replacementNode);
+                tree->root = replacementNode;
+            }
+            else {
                 avlUpdateMaxScores(locNode->parent);
+                if (locNode == locNode->parent->left)
+                    locNode->parent->left = replacementNode;
+                else
+                    locNode->parent->right = replacementNode;
+            }
+
             locNode->left = NULL;
             locNode->right = NULL;
             if (freeNodeMem)
@@ -450,7 +468,7 @@ int avlRemoveNode(avl * tree, avlNode *locNode, avlNode *delNode, char freeNodeM
     // The node is in the left subtree
     else if (diff > 0) {
         if (locNode->left) {
-            heightDelta = avlRemoveNode(tree, locNode->left,delNode,1,removed);
+            heightDelta = avlRemoveNode(tree, locNode->left,delNode,freeNodeMem,removed);
             if (heightDelta) {
                 locNode->balance = locNode->balance + 1;
                 if (locNode->balance == 0)
@@ -499,7 +517,7 @@ int avlRemoveNode(avl * tree, avlNode *locNode, avlNode *delNode, char freeNodeM
     // The node is in the right subtree
     else if (diff < 0) {
         if (locNode->right) {
-            heightDelta = avlRemoveNode(tree, locNode->right,delNode,1,removed);
+            heightDelta = avlRemoveNode(tree, locNode->right,delNode,freeNodeMem,removed);
             if (heightDelta) {
                 locNode->balance = locNode->balance - 1;
                 if (locNode->balance == 0)
