@@ -52,12 +52,53 @@
  *      String value with length less than or equal to 16383 bytes (14 bits).
  * |10______|qqqqqqqq|rrrrrrrr|ssssssss|tttttttt| - 5 bytes
  *      String value with length greater than or equal to 16384 bytes.
- * |1100____| - 1 byte
+ * |11000000| - 1 byte
  *      Integer encoded as int16_t (2 bytes).
- * |1101____| - 1 byte
+ * |11010000| - 1 byte
  *      Integer encoded as int32_t (4 bytes).
- * |1110____| - 1 byte
+ * |11100000| - 1 byte
  *      Integer encoded as int64_t (8 bytes).
+ * |11110000| - 1 byte
+ *      Integer encoded as 24 bit signed (3 bytes).
+ * |11111110| - 1 byte
+ *      Integer encoded as 8 bit signed (1 byte).
+ * |1111xxxx| - (with xxxx between 0000 and 1101) immediate 4 bit integer.
+ *      Unsigned integer from 0 to 12. The encoded value is actually from
+ *      1 to 13 because 0000 and 1111 can not be used, so 1 should be
+ *      subtracted from the encoded 4 bit value to obtain the right value.
+ * |11111111| - End of ziplist.
+ *
+ * All the integers are represented in little endian byte order.
+ *
+ * ----------------------------------------------------------------------------
+ *
+ * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include <stdio.h>
@@ -75,14 +116,24 @@
 #define ZIP_BIGLEN 254
 
 /* Different encoding/length possibilities */
-#define ZIP_STR_MASK (0xc0)
-#define ZIP_INT_MASK (0x30)
+#define ZIP_STR_MASK 0xc0
+#define ZIP_INT_MASK 0x30
 #define ZIP_STR_06B (0 << 6)
 #define ZIP_STR_14B (1 << 6)
 #define ZIP_STR_32B (2 << 6)
 #define ZIP_INT_16B (0xc0 | 0<<4)
 #define ZIP_INT_32B (0xc0 | 1<<4)
 #define ZIP_INT_64B (0xc0 | 2<<4)
+#define ZIP_INT_24B (0xc0 | 3<<4)
+#define ZIP_INT_8B 0xfe
+/* 4 bit integer immediate encoding */
+#define ZIP_INT_IMM_MASK 0x0f
+#define ZIP_INT_IMM_MIN 0xf1    /* 11110001 */
+#define ZIP_INT_IMM_MAX 0xfd    /* 11111101 */
+#define ZIP_INT_IMM_VAL(v) (v & ZIP_INT_IMM_MASK)
+
+#define INT24_MAX 0x7fffff
+#define INT24_MIN (-INT24_MAX - 1)
 
 /* Macro to determine type */
 #define ZIP_IS_STR(enc) (((enc) & ZIP_STR_MASK) < ZIP_STR_MASK)
@@ -111,20 +162,22 @@ typedef struct zlentry {
     unsigned char *p;
 } zlentry;
 
-#define ZIP_ENTRY_ENCODING(ptr, encoding) do {                                 \
-    (encoding) = (ptr[0]) & (ZIP_STR_MASK | ZIP_INT_MASK);                     \
-    if (((encoding) & ZIP_STR_MASK) < ZIP_STR_MASK) {                          \
-        /* String encoding: 2 MSBs */                                          \
-        (encoding) &= ZIP_STR_MASK;                                            \
-    }                                                                          \
+/* Extract the encoding from the byte pointed by 'ptr' and set it into
+ * 'encoding'. */
+#define ZIP_ENTRY_ENCODING(ptr, encoding) do {  \
+    (encoding) = (ptr[0]); \
+    if ((encoding) < ZIP_STR_MASK) (encoding) &= ZIP_STR_MASK; \
 } while(0)
 
 /* Return bytes needed to store integer encoded by 'encoding' */
 static unsigned int zipIntSize(unsigned char encoding) {
     switch(encoding) {
-    case ZIP_INT_16B: return sizeof(int16_t);
-    case ZIP_INT_32B: return sizeof(int32_t);
-    case ZIP_INT_64B: return sizeof(int64_t);
+    case ZIP_INT_8B:  return 1;
+    case ZIP_INT_16B: return 2;
+    case ZIP_INT_24B: return 3;
+    case ZIP_INT_32B: return 4;
+    case ZIP_INT_64B: return 8;
+    default: return 0; /* 4 bit immediate */
     }
     assert(NULL);
     return 0;
@@ -269,8 +322,14 @@ static int zipTryEncoding(unsigned char *entry, unsigned int entrylen, long long
     if (string2ll((char*)entry,entrylen,&value)) {
         /* Great, the string can be encoded. Check what's the smallest
          * of our encoding types that can hold this value. */
-        if (value >= INT16_MIN && value <= INT16_MAX) {
+        if (value >= 0 && value <= 12) {
+            *encoding = ZIP_INT_IMM_MIN+value;
+        } else if (value >= INT8_MIN && value <= INT8_MAX) {
+            *encoding = ZIP_INT_8B;
+        } else if (value >= INT16_MIN && value <= INT16_MAX) {
             *encoding = ZIP_INT_16B;
+        } else if (value >= INT24_MIN && value <= INT24_MAX) {
+            *encoding = ZIP_INT_24B;
         } else if (value >= INT32_MIN && value <= INT32_MAX) {
             *encoding = ZIP_INT_32B;
         } else {
@@ -287,10 +346,16 @@ static void zipSaveInteger(unsigned char *p, int64_t value, unsigned char encodi
     int16_t i16;
     int32_t i32;
     int64_t i64;
-    if (encoding == ZIP_INT_16B) {
+    if (encoding == ZIP_INT_8B) {
+        ((int8_t*)p)[0] = (int8_t)value;
+    } else if (encoding == ZIP_INT_16B) {
         i16 = value;
         memcpy(p,&i16,sizeof(i16));
         memrev16ifbe(p);
+    } else if (encoding == ZIP_INT_24B) {
+        i32 = value<<8;
+        memrev32ifbe(&i32);
+        memcpy(p,((uint8_t*)&i32)+1,sizeof(i32)-sizeof(uint8_t));
     } else if (encoding == ZIP_INT_32B) {
         i32 = value;
         memcpy(p,&i32,sizeof(i32));
@@ -299,6 +364,8 @@ static void zipSaveInteger(unsigned char *p, int64_t value, unsigned char encodi
         i64 = value;
         memcpy(p,&i64,sizeof(i64));
         memrev64ifbe(p);
+    } else if (encoding >= ZIP_INT_IMM_MIN && encoding <= ZIP_INT_IMM_MAX) {
+        /* Nothing to do, the value is stored in the encoding itself. */
     } else {
         assert(NULL);
     }
@@ -309,7 +376,9 @@ static int64_t zipLoadInteger(unsigned char *p, unsigned char encoding) {
     int16_t i16;
     int32_t i32;
     int64_t i64, ret = 0;
-    if (encoding == ZIP_INT_16B) {
+    if (encoding == ZIP_INT_8B) {
+        ret = ((int8_t*)p)[0];
+    } else if (encoding == ZIP_INT_16B) {
         memcpy(&i16,p,sizeof(i16));
         memrev16ifbe(&i16);
         ret = i16;
@@ -317,10 +386,17 @@ static int64_t zipLoadInteger(unsigned char *p, unsigned char encoding) {
         memcpy(&i32,p,sizeof(i32));
         memrev32ifbe(&i32);
         ret = i32;
+    } else if (encoding == ZIP_INT_24B) {
+        i32 = 0;
+        memcpy(((uint8_t*)&i32)+1,p,sizeof(i32)-sizeof(uint8_t));
+        memrev32ifbe(&i32);
+        ret = i32>>8;
     } else if (encoding == ZIP_INT_64B) {
         memcpy(&i64,p,sizeof(i64));
         memrev64ifbe(&i64);
         ret = i64;
+    } else if (encoding >= ZIP_INT_IMM_MIN && encoding <= ZIP_INT_IMM_MAX) {
+        ret = (encoding & ZIP_INT_IMM_MASK)-1;
     } else {
         assert(NULL);
     }
@@ -454,12 +530,13 @@ static unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsig
     totlen = p-first.p;
     if (totlen > 0) {
         if (p[0] != ZIP_END) {
-            /* Tricky: storing the prevlen in this entry might reduce or
-             * increase the number of bytes needed, compared to the current
-             * prevlen. Note that we can always store this length because
-             * it was previously stored by an entry that is being deleted. */
+            /* Storing `prevrawlen` in this entry may increase or decrease the
+             * number of bytes required compare to the current `prevrawlen`.
+             * There always is room to store this, because it was previously
+             * stored by an entry that is now being deleted. */
             nextdiff = zipPrevLenByteDiff(p,first.prevrawlen);
-            zipPrevEncodeLength(p-nextdiff,first.prevrawlen);
+            p -= nextdiff;
+            zipPrevEncodeLength(p,first.prevrawlen);
 
             /* Update offset for tail */
             ZIPLIST_TAIL_OFFSET(zl) =
@@ -475,8 +552,8 @@ static unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsig
             }
 
             /* Move tail to the front of the ziplist */
-            memmove(first.p,p-nextdiff,
-                intrev32ifbe(ZIPLIST_BYTES(zl))-(p-zl)-1+nextdiff);
+            memmove(first.p,p,
+                intrev32ifbe(ZIPLIST_BYTES(zl))-(p-zl)-1);
         } else {
             /* The entire tail was deleted. No need to move memory. */
             ZIPLIST_TAIL_OFFSET(zl) =
@@ -662,10 +739,10 @@ unsigned char *ziplistPrev(unsigned char *zl, unsigned char *p) {
     }
 }
 
-/* Get entry pointer to by 'p' and store in either 'e' or 'v' depending
+/* Get entry pointed to by 'p' and store in either 'e' or 'v' depending
  * on the encoding of the entry. 'e' is always set to NULL to be able
  * to find out whether the string pointer or the integer value was set.
- * Return 0 if 'p' points to the end of the zipmap, 1 otherwise. */
+ * Return 0 if 'p' points to the end of the ziplist, 1 otherwise. */
 unsigned int ziplistGet(unsigned char *p, unsigned char **sstr, unsigned int *slen, long long *sval) {
     zlentry entry;
     if (p == NULL || p[0] == ZIP_END) return 0;
@@ -727,12 +804,11 @@ unsigned int ziplistCompare(unsigned char *p, unsigned char *sstr, unsigned int 
             return 0;
         }
     } else {
-        /* Try to compare encoded values */
+        /* Try to compare encoded values. Don't compare encoding because
+         * different implementations may encoded integers differently. */
         if (zipTryEncoding(sstr,slen,&sval,&sencoding)) {
-            if (entry.encoding == sencoding) {
-                zval = zipLoadInteger(p+entry.headersize,entry.encoding);
-                return zval == sval;
-            }
+          zval = zipLoadInteger(p+entry.headersize,entry.encoding);
+          return zval == sval;
         }
     }
     return 0;
@@ -760,19 +836,24 @@ unsigned char *ziplistFind(unsigned char *p, unsigned char *vstr, unsigned int v
                     return p;
                 }
             } else {
-                /* Find out if the specified entry can be encoded */
+                /* Find out if the searched field can be encoded. Note that
+                 * we do it only the first time, once done vencoding is set
+                 * to non-zero and vll is set to the integer value. */
                 if (vencoding == 0) {
-                    /* UINT_MAX when the entry CANNOT be encoded */
                     if (!zipTryEncoding(vstr, vlen, &vll, &vencoding)) {
+                        /* If the entry can't be encoded we set it to
+                         * UCHAR_MAX so that we don't retry again the next
+                         * time. */
                         vencoding = UCHAR_MAX;
                     }
-
                     /* Must be non-zero by now */
                     assert(vencoding);
                 }
 
-                /* Compare current entry with specified entry */
-                if (encoding == vencoding) {
+                /* Compare current entry with specified entry, do it only
+                 * if vencoding != UCHAR_MAX because if there is no encoding
+                 * possible for the field it can't be a valid integer. */
+                if (vencoding != UCHAR_MAX) {
                     long long ll = zipLoadInteger(q, encoding);
                     if (ll == vll) {
                         return p;
@@ -982,6 +1063,22 @@ int randstring(char *target, unsigned int min, unsigned int max) {
     while(p < len)
         target[p++] = minval+rand()%(maxval-minval+1);
     return len;
+}
+
+void verify(unsigned char *zl, zlentry *e) {
+    int i;
+    int len = ziplistLen(zl);
+    zlentry _e;
+
+    for (i = 0; i < len; i++) {
+        memset(&e[i], 0, sizeof(zlentry));
+        e[i] = zipEntry(ziplistIndex(zl, i));
+
+        memset(&_e, 0, sizeof(zlentry));
+        _e = zipEntry(ziplistIndex(zl, -len+i));
+
+        assert(memcmp(&e[i], &_e, sizeof(zlentry)) == 0);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -1262,6 +1359,43 @@ int main(int argc, char **argv) {
         p = ziplistIndex(zl,1);
         assert(ziplistGet(p,&entry,&elen,&value));
         assert(strncmp(v2,(char*)entry,elen) == 0);
+        printf("SUCCESS\n\n");
+    }
+
+    printf("Regression test deleting next to last entries:\n");
+    {
+        char v[3][257];
+        zlentry e[3];
+        int i;
+
+        for (i = 0; i < (sizeof(v)/sizeof(v[0])); i++) {
+            memset(v[i], 'a' + i, sizeof(v[0]));
+        }
+
+        v[0][256] = '\0';
+        v[1][  1] = '\0';
+        v[2][256] = '\0';
+
+        zl = ziplistNew();
+        for (i = 0; i < (sizeof(v)/sizeof(v[0])); i++) {
+            zl = ziplistPush(zl, (unsigned char *) v[i], strlen(v[i]), ZIPLIST_TAIL);
+        }
+
+        verify(zl, e);
+
+        assert(e[0].prevrawlensize == 1);
+        assert(e[1].prevrawlensize == 5);
+        assert(e[2].prevrawlensize == 1);
+
+        /* Deleting entry 1 will increase `prevrawlensize` for entry 2 */
+        unsigned char *p = e[1].p;
+        zl = ziplistDelete(zl, &p);
+
+        verify(zl, e);
+
+        assert(e[0].prevrawlensize == 1);
+        assert(e[1].prevrawlensize == 5);
+
         printf("SUCCESS\n\n");
     }
 

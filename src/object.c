@@ -1,3 +1,33 @@
+/* Redis Object implementation.
+ *
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 #include <math.h>
 #include <ctype.h>
@@ -9,18 +39,8 @@ robj *createObject(int type, void *ptr) {
     o->ptr = ptr;
     o->refcount = 1;
 
-    /* Set the LRU to the current lruclock (minutes resolution).
-     * We do this regardless of the fact VM is active as LRU is also
-     * used for the maxmemory directive when Redis is used as cache.
-     *
-     * Note that this code may run in the context of an I/O thread
-     * and accessing server.lruclock in theory is an error
-     * (no locks). But in practice this is safe, and even if we read
-     * garbage Redis will not fail. */
+    /* Set the LRU to the current lruclock (minutes resolution). */
     o->lru = server.lruclock;
-    /* The following is only needed if VM is active, but since the conditional
-     * is probably more costly than initializing the field it's better to
-     * have every field properly initialized anyway. */
     return o;
 }
 
@@ -52,7 +72,7 @@ robj *createStringObjectFromLongDouble(long double value) {
     int len;
 
     /* We use 17 digits precision since with 128 bit floats that precision
-     * after rouding is able to represent most small decimal numbers in a way
+     * after rounding is able to represent most small decimal numbers in a way
      * that is "non surprising" for the user (that is, most small decimal
      * numbers will be represented in a way that when converted back into
      * a string are exactly the same as what the user typed.) */
@@ -79,6 +99,13 @@ robj *createListObject(void) {
     robj *o = createObject(REDIS_LIST,l);
     listSetFreeMethod(l,decrRefCount);
     o->encoding = REDIS_ENCODING_LINKEDLIST;
+    return o;
+}
+
+robj *createIsetObject(void) {
+    avl *a = avlCreate();
+    robj *o = createObject(REDIS_ISET,a);
+    o->encoding = REDIS_ENCODING_AVLTREE;
     return o;
 }
 
@@ -177,6 +204,10 @@ void freeZsetObject(robj *o) {
     }
 }
 
+void freeIsetObject(robj *o) {
+    avlFree(o->ptr);
+}
+
 void freeHashObject(robj *o) {
     switch (o->encoding) {
     case REDIS_ENCODING_HT:
@@ -206,6 +237,7 @@ void decrRefCount(void *obj) {
         case REDIS_SET: freeSetObject(o); break;
         case REDIS_ZSET: freeZsetObject(o); break;
         case REDIS_HASH: freeHashObject(o); break;
+        case REDIS_ISET: freeIsetObject(o); break;
         default: redisPanic("Unknown object type"); break;
         }
         zfree(o);
@@ -270,9 +302,7 @@ robj *tryObjectEncoding(robj *o) {
 
     /* Ok, this object can be encoded...
      *
-     * Can I use a shared object? Only if the object is inside a given
-     * range and if the back end in use is in-memory. For disk store every
-     * object in memory used as value should be independent.
+     * Can I use a shared object? Only if the object is inside a given range
      *
      * Note that we also avoid using shared integers when maxmemory is used
      * because every object needs to have a private LRU field for the LRU

@@ -1,3 +1,32 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 #include "sha1.h"   /* SHA1 is used for DEBUG DIGEST */
 
@@ -7,12 +36,13 @@
 #ifdef HAVE_BACKTRACE
 #include <execinfo.h>
 #include <ucontext.h>
+#include <fcntl.h>
 #endif /* HAVE_BACKTRACE */
 
 /* ================================= Debugging ============================== */
 
 /* Compute the sha1 of string at 's' with 'len' bytes long.
- * The SHA1 is then xored againt the string pointed by digest.
+ * The SHA1 is then xored against the string pointed by digest.
  * Since xor is commutative, this operation is used in order to
  * "add" digests relative to unordered elements.
  *
@@ -37,7 +67,7 @@ void xorObjectDigest(unsigned char *digest, robj *o) {
 }
 
 /* This function instead of just computing the SHA1 and xoring it
- * against diget, also perform the digest of "digest" itself and
+ * against digest, also perform the digest of "digest" itself and
  * replace the old value with the new one.
  *
  * So the final digest will be:
@@ -105,7 +135,6 @@ void computeDatasetDigest(unsigned char *final) {
 
             mixDigest(digest,key,sdslen(key));
 
-            /* Make sure the key is loaded if VM is active */
             o = dictGetVal(de);
 
             aux = htonl(o->type);
@@ -218,6 +247,10 @@ void computeDatasetDigest(unsigned char *final) {
 void debugCommand(redisClient *c) {
     if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
         *((char*)-1) = 'x';
+    } else if (!strcasecmp(c->argv[1]->ptr,"oom")) {
+        void *ptr = zmalloc(ULONG_MAX); /* Should trigger an out of memory. */
+        zfree(ptr);
+        addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"assert")) {
         if (c->argc >= 3) c->argv[2] = tryObjectEncoding(c->argv[2]);
         redisAssertWithInfo(c,c->argv[0],1 == 2);
@@ -297,9 +330,14 @@ void debugCommand(redisClient *c) {
 
         usleep(utime);
         addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"set-active-expire") &&
+               c->argc == 3)
+    {
+        server.active_expire_enabled = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
     } else {
-        addReplyError(c,
-            "Syntax error, try DEBUG [SEGFAULT|OBJECT <key>|SWAPIN <key>|SWAPOUT <key>|RELOAD]");
+        addReplyErrorFormat(c, "Unknown DEBUG subcommand or wrong number of arguments for '%s'",
+            (char*)c->argv[1]->ptr);
     }
 }
 
@@ -399,30 +437,31 @@ void bugReportStart(void) {
 
 #ifdef HAVE_BACKTRACE
 static void *getMcontextEip(ucontext_t *uc) {
-#if defined(__FreeBSD__)
-    return (void*) uc->uc_mcontext.mc_eip;
-#elif defined(__dietlibc__)
-    return (void*) uc->uc_mcontext.eip;
-#elif defined(__APPLE__) && !defined(MAC_OS_X_VERSION_10_6)
-  #if __x86_64__
+#if defined(__APPLE__) && !defined(MAC_OS_X_VERSION_10_6)
+    /* OSX < 10.6 */
+    #if defined(__x86_64__)
     return (void*) uc->uc_mcontext->__ss.__rip;
-  #elif __i386__
+    #elif defined(__i386__)
     return (void*) uc->uc_mcontext->__ss.__eip;
-  #else
+    #else
     return (void*) uc->uc_mcontext->__ss.__srr0;
-  #endif
+    #endif
 #elif defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
-  #if defined(_STRUCT_X86_THREAD_STATE64) && !defined(__i386__)
+    /* OSX >= 10.6 */
+    #if defined(_STRUCT_X86_THREAD_STATE64) && !defined(__i386__)
     return (void*) uc->uc_mcontext->__ss.__rip;
-  #else
+    #else
     return (void*) uc->uc_mcontext->__ss.__eip;
-  #endif
-#elif defined(__i386__)
+    #endif
+#elif defined(__linux__)
+    /* Linux */
+    #if defined(__i386__)
     return (void*) uc->uc_mcontext.gregs[14]; /* Linux 32 */
-#elif defined(__X86_64__) || defined(__x86_64__)
+    #elif defined(__X86_64__) || defined(__x86_64__)
     return (void*) uc->uc_mcontext.gregs[16]; /* Linux 64 */
-#elif defined(__ia64__) /* Linux IA64 */
+    #elif defined(__ia64__) /* Linux IA64 */
     return (void*) uc->uc_mcontext.sc_ip;
+    #endif
 #else
     return NULL;
 #endif
@@ -440,8 +479,11 @@ void logStackContent(void **sp) {
 
 void logRegisters(ucontext_t *uc) {
     redisLog(REDIS_WARNING, "--- REGISTERS");
+
+/* OSX */
 #if defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_6)
-  #if defined(_STRUCT_X86_THREAD_STATE64) && !defined(__i386__)
+  /* OSX AMD64 */
+    #if defined(_STRUCT_X86_THREAD_STATE64) && !defined(__i386__)
     redisLog(REDIS_WARNING,
     "\n"
     "RAX:%016lx RBX:%016lx\nRCX:%016lx RDX:%016lx\n"
@@ -472,7 +514,8 @@ void logRegisters(ucontext_t *uc) {
         uc->uc_mcontext->__ss.__gs
     );
     logStackContent((void**)uc->uc_mcontext->__ss.__rsp);
-  #else
+    #else
+    /* OSX x86 */
     redisLog(REDIS_WARNING,
     "\n"
     "EAX:%08lx EBX:%08lx ECX:%08lx EDX:%08lx\n"
@@ -497,8 +540,11 @@ void logRegisters(ucontext_t *uc) {
         uc->uc_mcontext->__ss.__gs
     );
     logStackContent((void**)uc->uc_mcontext->__ss.__esp);
-  #endif
-#elif defined(__i386__)
+    #endif
+/* Linux */
+#elif defined(__linux__)
+    /* Linux x86 */
+    #if defined(__i386__)
     redisLog(REDIS_WARNING,
     "\n"
     "EAX:%08lx EBX:%08lx ECX:%08lx EDX:%08lx\n"
@@ -523,7 +569,8 @@ void logRegisters(ucontext_t *uc) {
         uc->uc_mcontext.gregs[0]
     );
     logStackContent((void**)uc->uc_mcontext.gregs[7]);
-#elif defined(__X86_64__) || defined(__x86_64__)
+    #elif defined(__X86_64__) || defined(__x86_64__)
+    /* Linux AMD64 */
     redisLog(REDIS_WARNING,
     "\n"
     "RAX:%016lx RBX:%016lx\nRCX:%016lx RDX:%016lx\n"
@@ -552,16 +599,78 @@ void logRegisters(ucontext_t *uc) {
         uc->uc_mcontext.gregs[18]
     );
     logStackContent((void**)uc->uc_mcontext.gregs[15]);
+    #endif
 #else
     redisLog(REDIS_WARNING,
         "  Dumping of registers not supported for this OS/arch");
 #endif
 }
 
-void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
+/* Logs the stack trace using the backtrace() call. This function is designed
+ * to be called from signal handlers safely. */
+void logStackTrace(ucontext_t *uc) {
     void *trace[100];
-    char **messages = NULL;
-    int i, trace_size = 0;
+    int trace_size = 0, fd;
+
+    /* Open the log file in append mode. */
+    fd = server.logfile ?
+        open(server.logfile, O_APPEND|O_CREAT|O_WRONLY, 0644) :
+        STDOUT_FILENO;
+    if (fd == -1) return;
+
+    /* Generate the stack trace */
+    trace_size = backtrace(trace, 100);
+
+    /* overwrite sigaction with caller's address */
+    if (getMcontextEip(uc) != NULL)
+        trace[1] = getMcontextEip(uc);
+
+    /* Write symbols to log file */
+    backtrace_symbols_fd(trace, trace_size, fd);
+
+    /* Cleanup */
+    if (server.logfile) close(fd);
+}
+
+/* Log information about the "current" client, that is, the client that is
+ * currently being served by Redis. May be NULL if Redis is not serving a
+ * client right now. */
+void logCurrentClient(void) {
+    if (server.current_client == NULL) return;
+
+    redisClient *cc = server.current_client;
+    sds client;
+    int j;
+
+    redisLog(REDIS_WARNING, "--- CURRENT CLIENT INFO");
+    client = getClientInfoString(cc);
+    redisLog(REDIS_WARNING,"client: %s", client);
+    sdsfree(client);
+    for (j = 0; j < cc->argc; j++) {
+        robj *decoded;
+
+        decoded = getDecodedObject(cc->argv[j]);
+        redisLog(REDIS_WARNING,"argv[%d]: '%s'", j, (char*)decoded->ptr);
+        decrRefCount(decoded);
+    }
+    /* Check if the first argument, usually a key, is found inside the
+     * selected DB, and if so print info about the associated object. */
+    if (cc->argc >= 1) {
+        robj *val, *key;
+        dictEntry *de;
+
+        key = getDecodedObject(cc->argv[1]);
+        de = dictFind(cc->db->dict, key->ptr);
+        if (de) {
+            val = dictGetVal(de);
+            redisLog(REDIS_WARNING,"key '%s' found in DB containing the following object:", key->ptr);
+            redisLogObjectDebugInfo(val);
+        }
+        decrRefCount(key);
+    }
+}
+
+void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     ucontext_t *uc = (ucontext_t*) secret;
     sds infostring, clients;
     struct sigaction act;
@@ -574,17 +683,9 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
         "    Failed assertion: %s (%s:%d)", server.assert_failed,
                         server.assert_file, server.assert_line);
 
-    /* Generate the stack trace */
-    trace_size = backtrace(trace, 100);
-
-    /* overwrite sigaction with caller's address */
-    if (getMcontextEip(uc) != NULL) {
-        trace[1] = getMcontextEip(uc);
-    }
-    messages = backtrace_symbols(trace, trace_size);
+    /* Log the stack trace */
     redisLog(REDIS_WARNING, "--- STACK TRACE");
-    for (i=1; i<trace_size; ++i)
-        redisLog(REDIS_WARNING,"%s", messages[i]);
+    logStackTrace(uc);
 
     /* Log INFO and CLIENT LIST */
     redisLog(REDIS_WARNING, "--- INFO OUTPUT");
@@ -595,41 +696,11 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     redisLog(REDIS_WARNING, "--- CLIENT LIST OUTPUT");
     clients = getAllClientsInfoString();
     redisLogRaw(REDIS_WARNING, clients);
-    /* Don't sdsfree() strings to avoid a crash. Memory may be corrupted. */
+    sdsfree(infostring);
+    sdsfree(clients);
 
-    /* Log CURRENT CLIENT info */
-    if (server.current_client) {
-        redisClient *cc = server.current_client;
-        sds client;
-        int j;
-
-        redisLog(REDIS_WARNING, "--- CURRENT CLIENT INFO");
-        client = getClientInfoString(cc);
-        redisLog(REDIS_WARNING,"client: %s", client);
-        /* Missing sdsfree(client) to avoid crash if memory is corrupted. */
-        for (j = 0; j < cc->argc; j++) {
-            robj *decoded;
-
-            decoded = getDecodedObject(cc->argv[j]);
-            redisLog(REDIS_WARNING,"argv[%d]: '%s'", j, (char*)decoded->ptr);
-            decrRefCount(decoded);
-        }
-        /* Check if the first argument, usually a key, is found inside the
-         * selected DB, and if so print info about the associated object. */
-        if (cc->argc >= 1) {
-            robj *val, *key;
-            dictEntry *de;
-
-            key = getDecodedObject(cc->argv[1]);
-            de = dictFind(cc->db->dict, key->ptr);
-            if (de) {
-                val = dictGetVal(de);
-                redisLog(REDIS_WARNING,"key '%s' found in DB containing the following object:", key->ptr);
-                redisLogObjectDebugInfo(val);
-            }
-            decrRefCount(key);
-        }
-    }
+    /* Log the current client */
+    logCurrentClient();
 
     /* Log dump of processor registers */
     logRegisters(uc);
@@ -646,11 +717,105 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     /* Make sure we exit with the right signal at the end. So for instance
      * the core will be dumped if enabled. */
     sigemptyset (&act.sa_mask);
-    /* When the SA_SIGINFO flag is set in sa_flags then sa_sigaction
-     * is used. Otherwise, sa_handler is used */
     act.sa_flags = SA_NODEFER | SA_ONSTACK | SA_RESETHAND;
     act.sa_handler = SIG_DFL;
     sigaction (sig, &act, NULL);
     kill(getpid(),sig);
 }
 #endif /* HAVE_BACKTRACE */
+
+/* ==================== Logging functions for debugging ===================== */
+
+void redisLogHexDump(int level, char *descr, void *value, size_t len) {
+    char buf[65], *b;
+    unsigned char *v = value;
+    char charset[] = "0123456789abcdef";
+
+    redisLog(level,"%s (hexdump):", descr);
+    b = buf;
+    while(len) {
+        b[0] = charset[(*v)>>4];
+        b[1] = charset[(*v)&0xf];
+        b[2] = '\0';
+        b += 2;
+        len--;
+        v++;
+        if (b-buf == 64 || len == 0) {
+            redisLogRaw(level|REDIS_LOG_RAW,buf);
+            b = buf;
+        }
+    }
+    redisLogRaw(level|REDIS_LOG_RAW,"\n");
+}
+
+/* =========================== Software Watchdog ============================ */
+#include <sys/time.h>
+
+void watchdogSignalHandler(int sig, siginfo_t *info, void *secret) {
+#ifdef HAVE_BACKTRACE
+    ucontext_t *uc = (ucontext_t*) secret;
+#endif
+    REDIS_NOTUSED(info);
+    REDIS_NOTUSED(sig);
+
+    redisLogFromHandler(REDIS_WARNING,"\n--- WATCHDOG TIMER EXPIRED ---");
+#ifdef HAVE_BACKTRACE
+    logStackTrace(uc);
+#else
+    redisLogFromHandler(REDIS_WARNING,"Sorry: no support for backtrace().");
+#endif
+    redisLogFromHandler(REDIS_WARNING,"--------\n");
+}
+
+/* Schedule a SIGALRM delivery after the specified period in milliseconds.
+ * If a timer is already scheduled, this function will re-schedule it to the
+ * specified time. If period is 0 the current timer is disabled. */
+void watchdogScheduleSignal(int period) {
+    struct itimerval it;
+
+    /* Will stop the timer if period is 0. */
+    it.it_value.tv_sec = period/1000;
+    it.it_value.tv_usec = (period%1000)*1000;
+    /* Don't automatically restart. */
+    it.it_interval.tv_sec = 0;
+    it.it_interval.tv_usec = 0;
+    setitimer(ITIMER_REAL, &it, NULL);
+}
+
+/* Enable the software watchdong with the specified period in milliseconds. */
+void enableWatchdog(int period) {
+    int min_period;
+
+    if (server.watchdog_period == 0) {
+        struct sigaction act;
+
+        /* Watchdog was actually disabled, so we have to setup the signal
+         * handler. */
+        sigemptyset(&act.sa_mask);
+        act.sa_flags = SA_NODEFER | SA_ONSTACK | SA_SIGINFO;
+        act.sa_sigaction = watchdogSignalHandler;
+        sigaction(SIGALRM, &act, NULL);
+    }
+    /* If the configured period is smaller than twice the timer period, it is
+     * too short for the software watchdog to work reliably. Fix it now
+     * if needed. */
+    min_period = (1000/server.hz)*2;
+    if (period < min_period) period = min_period;
+    watchdogScheduleSignal(period); /* Adjust the current timer. */
+    server.watchdog_period = period;
+}
+
+/* Disable the software watchdog. */
+void disableWatchdog(void) {
+    struct sigaction act;
+    if (server.watchdog_period == 0) return; /* Already disabled. */
+    watchdogScheduleSignal(0); /* Stop the current timer. */
+
+    /* Set the signal handler to SIG_IGN, this will also remove pending
+     * signals from the queue. */
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    act.sa_handler = SIG_IGN;
+    sigaction(SIGALRM, &act, NULL);
+    server.watchdog_period = 0;
+}

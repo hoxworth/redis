@@ -1,3 +1,32 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,11 +45,11 @@
 #endif
 
 #ifdef MEMTEST_32BIT
-#define ULONG_ONEZERO 0xaaaaaaaaaaaaaaaaUL
-#define ULONG_ZEROONE 0x5555555555555555UL
-#else
 #define ULONG_ONEZERO 0xaaaaaaaaUL
 #define ULONG_ZEROONE 0x55555555UL
+#else
+#define ULONG_ONEZERO 0xaaaaaaaaaaaaaaaaUL
+#define ULONG_ZEROONE 0x5555555555555555UL
 #endif
 
 static struct winsize ws;
@@ -47,12 +76,10 @@ void memtest_progress_end(void) {
 }
 
 void memtest_progress_step(size_t curr, size_t size, char c) {
-    size_t chars = (curr*progress_full)/size, j;
+    size_t chars = ((unsigned long long)curr*progress_full)/size, j;
 
-    for (j = 0; j < chars-progress_printed; j++) {
-        printf("%c",c);
-        progress_printed++;
-    }
+    for (j = 0; j < chars-progress_printed; j++) printf("%c",c);
+    progress_printed = chars;
     fflush(stdout);
 }
 
@@ -132,13 +159,13 @@ void memtest_fill_value(unsigned long *l, size_t bytes, unsigned long v1,
         v = (off & 1) ? v2 : v1;
         for (w = 0; w < iwords; w++) {
 #ifdef MEMTEST_32BIT
-            *l1 = *l2 = ((unsigned long)     (rand()&0xffff)) |
-                        (((unsigned long)    (rand()&0xffff)) << 16);
+            *l1 = *l2 = ((unsigned long)     v) |
+                        (((unsigned long)    v) << 16);
 #else
-            *l1 = *l2 = ((unsigned long)     (rand()&0xffff)) |
-                        (((unsigned long)    (rand()&0xffff)) << 16) |
-                        (((unsigned long)    (rand()&0xffff)) << 32) |
-                        (((unsigned long)    (rand()&0xffff)) << 48);
+            *l1 = *l2 = ((unsigned long)     v) |
+                        (((unsigned long)    v) << 16) |
+                        (((unsigned long)    v) << 32) |
+                        (((unsigned long)    v) << 48);
 #endif
             l1 += step;
             l2 += step;

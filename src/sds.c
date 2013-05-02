@@ -1,6 +1,6 @@
 /* SDSLib, A C dynamic strings library
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -141,7 +141,7 @@ size_t sdsAllocSize(sds s) {
  * right-trim the string.
  *
  * Using sdsIncrLen() and sdsMakeRoomFor() it is possible to mount the
- * following schema to cat bytes coming from the kerenl to the end of an
+ * following schema to cat bytes coming from the kernel to the end of an
  * sds string new things without copying into an intermediate buffer:
  *
  * oldlen = sdslen(s);
@@ -179,7 +179,7 @@ sds sdsgrowzero(sds s, size_t len) {
     return s;
 }
 
-sds sdscatlen(sds s, void *t, size_t len) {
+sds sdscatlen(sds s, const void *t, size_t len) {
     struct sdshdr *sh;
     size_t curlen = sdslen(s);
 
@@ -193,15 +193,15 @@ sds sdscatlen(sds s, void *t, size_t len) {
     return s;
 }
 
-sds sdscat(sds s, char *t) {
+sds sdscat(sds s, const char *t) {
     return sdscatlen(s, t, strlen(t));
 }
 
-sds sdscatsds(sds s, sds t) {
+sds sdscatsds(sds s, const sds t) {
     return sdscatlen(s, t, sdslen(t));
 }
 
-sds sdscpylen(sds s, char *t, size_t len) {
+sds sdscpylen(sds s, const char *t, size_t len) {
     struct sdshdr *sh = (void*) (s-(sizeof(struct sdshdr)));
     size_t totlen = sh->free+sh->len;
 
@@ -218,7 +218,7 @@ sds sdscpylen(sds s, char *t, size_t len) {
     return s;
 }
 
-sds sdscpy(sds s, char *t) {
+sds sdscpy(sds s, const char *t) {
     return sdscpylen(s, t, strlen(t));
 }
 
@@ -314,7 +314,7 @@ void sdstoupper(sds s) {
     for (j = 0; j < len; j++) s[j] = toupper(s[j]);
 }
 
-int sdscmp(sds s1, sds s2) {
+int sdscmp(const sds s1, const sds s2) {
     size_t l1, l2, minlen;
     int cmp;
 
@@ -342,7 +342,7 @@ int sdscmp(sds s1, sds s2) {
  * requires length arguments. sdssplit() is just the
  * same function but for zero-terminated strings.
  */
-sds *sdssplitlen(char *s, int len, char *sep, int seplen, int *count) {
+sds *sdssplitlen(const char *s, int len, const char *sep, int seplen, int *count) {
     int elements = 0, slots = 5, start = 0, j;
     sds *tokens;
 
@@ -413,7 +413,7 @@ sds sdsfromlonglong(long long value) {
     return sdsnewlen(p,32-(p-buf));
 }
 
-sds sdscatrepr(sds s, char *p, size_t len) {
+sds sdscatrepr(sds s, const char *p, size_t len) {
     s = sdscatlen(s,"\"",1);
     while(len--) {
         switch(*p) {
@@ -475,14 +475,21 @@ int hex_digit_to_int(char c) {
  * foo bar "newline are supported\n" and "\xff\x00otherstuff"
  *
  * The number of arguments is stored into *argc, and an array
- * of sds is returned. The caller should sdsfree() all the returned
- * strings and finally zfree() the array itself.
+ * of sds is returned.
+ *
+ * The caller should free the resulting array of sds strings with
+ * sdsfreesplitres().
  *
  * Note that sdscatrepr() is able to convert back a string into
  * a quoted string in the same format sdssplitargs() is able to parse.
+ *
+ * The function returns the allocated tokens on success, even when the
+ * input string is empty, or NULL if the input contains unbalanced
+ * quotes or closed quotes followed by non space characters
+ * as in: "foo"bar or "foo'
  */
-sds *sdssplitargs(char *line, int *argc) {
-    char *p = line;
+sds *sdssplitargs(const char *line, int *argc) {
+    const char *p = line;
     char *current = NULL;
     char **vector = NULL;
 
@@ -576,6 +583,8 @@ sds *sdssplitargs(char *line, int *argc) {
             (*argc)++;
             current = NULL;
         } else {
+            /* Even on empty input string return something not NULL. */
+            if (vector == NULL) vector = zmalloc(sizeof(void*));
             return vector;
         }
     }
@@ -585,18 +594,12 @@ err:
         sdsfree(vector[*argc]);
     zfree(vector);
     if (current) sdsfree(current);
+    *argc = 0;
     return NULL;
 }
 
-void sdssplitargs_free(sds *argv, int argc) {
-    int j;
-
-    for (j = 0 ;j < argc; j++) sdsfree(argv[j]);
-    zfree(argv);
-}
-
 /* Modify the string substituting all the occurrences of the set of
- * characters specifed in the 'from' string to the corresponding character
+ * characters specified in the 'from' string to the corresponding character
  * in the 'to' array.
  *
  * For instance: sdsmapchars(mystring, "ho", "01", 2)
@@ -604,7 +607,7 @@ void sdssplitargs_free(sds *argv, int argc) {
  *
  * The function returns the sds string pointer, that is always the same
  * as the input pointer since no resize is needed. */
-sds sdsmapchars(sds s, char *from, char *to, size_t setlen) {
+sds sdsmapchars(sds s, const char *from, const char *to, size_t setlen) {
     size_t j, i, l = sdslen(s);
 
     for (j = 0; j < l; j++) {

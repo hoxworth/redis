@@ -1,3 +1,32 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 
 /* ================================ MULTI/EXEC ============================== */
@@ -43,8 +72,15 @@ void queueMultiCommand(redisClient *c) {
 void discardTransaction(redisClient *c) {
     freeClientMultiState(c);
     initClientMultiState(c);
-    c->flags &= ~(REDIS_MULTI|REDIS_DIRTY_CAS);;
+    c->flags &= ~(REDIS_MULTI|REDIS_DIRTY_CAS|REDIS_DIRTY_EXEC);;
     unwatchAllKeys(c);
+}
+
+/* Flag the transacation as DIRTY_EXEC so that EXEC will fail.
+ * Should be called every time there is an error while queueing a command. */
+void flagTransaction(redisClient *c) {
+    if (c->flags & REDIS_MULTI)
+        c->flags |= REDIS_DIRTY_EXEC;
 }
 
 void multiCommand(redisClient *c) {
@@ -66,14 +102,12 @@ void discardCommand(redisClient *c) {
 }
 
 /* Send a MULTI command to all the slaves and AOF file. Check the execCommand
- * implememntation for more information. */
-void execCommandReplicateMulti(redisClient *c) {
+ * implementation for more information. */
+void execCommandPropagateMulti(redisClient *c) {
     robj *multistring = createStringObject("MULTI",5);
 
-    if (server.aof_state != REDIS_AOF_OFF)
-        feedAppendOnlyFile(server.multiCommand,c->db->id,&multistring,1);
-    if (listLength(server.slaves))
-        replicationFeedSlaves(server.slaves,c->db->id,&multistring,1);
+    propagate(server.multiCommand,c->db->id,&multistring,1,
+              REDIS_PROPAGATE_AOF|REDIS_PROPAGATE_REPL);
     decrRefCount(multistring);
 }
 
@@ -82,28 +116,25 @@ void execCommand(redisClient *c) {
     robj **orig_argv;
     int orig_argc;
     struct redisCommand *orig_cmd;
+    int must_propagate = 0; /* Need to propagate MULTI/EXEC to AOF / slaves? */
 
     if (!(c->flags & REDIS_MULTI)) {
         addReplyError(c,"EXEC without MULTI");
         return;
     }
 
-    /* Check if we need to abort the EXEC if some WATCHed key was touched.
-     * A failed EXEC will return a multi bulk nil object. */
-    if (c->flags & REDIS_DIRTY_CAS) {
-        freeClientMultiState(c);
-        initClientMultiState(c);
-        c->flags &= ~(REDIS_MULTI|REDIS_DIRTY_CAS);
-        unwatchAllKeys(c);
-        addReply(c,shared.nullmultibulk);
-        return;
+    /* Check if we need to abort the EXEC because:
+     * 1) Some WATCHed key was touched.
+     * 2) There was a previous error while queueing commands.
+     * A failed EXEC in the first case returns a multi bulk nil object
+     * (technically it is not an error but a special behavior), while
+     * in the second an EXECABORT error is returned. */
+    if (c->flags & (REDIS_DIRTY_CAS|REDIS_DIRTY_EXEC)) {
+        addReply(c, c->flags & REDIS_DIRTY_EXEC ? shared.execaborterr :
+                                                  shared.nullmultibulk);
+        discardTransaction(c);
+        goto handle_monitor;
     }
-
-    /* Replicate a MULTI request now that we are sure the block is executed.
-     * This way we'll deliver the MULTI/..../EXEC block as a whole and
-     * both the AOF and the replication link will have the same consistency
-     * and atomicity guarantees. */
-    execCommandReplicateMulti(c);
 
     /* Exec all the queued commands */
     unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
@@ -115,6 +146,16 @@ void execCommand(redisClient *c) {
         c->argc = c->mstate.commands[j].argc;
         c->argv = c->mstate.commands[j].argv;
         c->cmd = c->mstate.commands[j].cmd;
+
+        /* Propagate a MULTI request once we encounter the first write op.
+         * This way we'll deliver the MULTI/..../EXEC block as a whole and
+         * both the AOF and the replication link will have the same consistency
+         * and atomicity guarantees. */
+        if (!must_propagate && !(c->cmd->flags & REDIS_CMD_READONLY)) {
+            execCommandPropagateMulti(c);
+            must_propagate = 1;
+        }
+
         call(c,REDIS_CALL_FULL);
 
         /* Commands may alter argc/argv, restore mstate. */
@@ -125,13 +166,19 @@ void execCommand(redisClient *c) {
     c->argv = orig_argv;
     c->argc = orig_argc;
     c->cmd = orig_cmd;
-    freeClientMultiState(c);
-    initClientMultiState(c);
-    c->flags &= ~(REDIS_MULTI|REDIS_DIRTY_CAS);
-    /* Make sure the EXEC command is always replicated / AOF, since we
-     * always send the MULTI command (we can't know beforehand if the
-     * next operations will contain at least a modification to the DB). */
-    server.dirty++;
+    discardTransaction(c);
+    /* Make sure the EXEC command will be propagated as well if MULTI
+     * was already propagated. */
+    if (must_propagate) server.dirty++;
+
+handle_monitor:
+    /* Send EXEC to clients waiting data from MONITOR. We do it here
+     * since the natural order of commands execution is actually:
+     * MUTLI, EXEC, ... commands inside transaction ...
+     * Instead EXEC is flagged as REDIS_CMD_SKIP_MONITOR in the command
+     * table, and we do it here with correct ordering. */
+    if (listLength(server.monitors) && !server.loading)
+        replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
 }
 
 /* ===================== WATCH (CAS alike for MULTI/EXEC) ===================
@@ -173,7 +220,7 @@ void watchForKey(redisClient *c, robj *key) {
         incrRefCount(key);
     }
     listAddNodeTail(clients,c);
-    /* Add the new key to the lits of keys watched by this client */
+    /* Add the new key to the list of keys watched by this client */
     wk = zmalloc(sizeof(*wk));
     wk->key = key;
     wk->db = c->db;

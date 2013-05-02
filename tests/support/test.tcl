@@ -3,6 +3,10 @@ set ::num_passed 0
 set ::num_failed 0
 set ::tests_failed {}
 
+proc fail {msg} {
+    error "assertion:$msg"
+}
+
 proc assert {condition} {
     if {![uplevel 1 [list expr $condition]]} {
         error "assertion:Expected condition '$condition' to be true ([uplevel 1 [list subst -nocommands $condition]])"
@@ -18,6 +22,15 @@ proc assert_match {pattern value} {
 proc assert_equal {expected value} {
     if {$expected ne $value} {
         error "assertion:Expected '$value' to be equal to '$expected'"
+    }
+}
+
+proc assert_equal_elements {expected value} {
+    if {[llength $expected] ne [llength $value]} {
+        error "assertion: '$value' does not contain the same members as '$expected'"
+    }
+    if {[lsort $expected] ne [lsort $value]} {
+        error "assertion: '$value' does not contain the same members as '$expected'"
     }
 }
 
@@ -42,6 +55,19 @@ proc assert_encoding {enc key} {
 
 proc assert_type {type key} {
     assert_equal $type [r type $key]
+}
+
+# Wait for the specified condition to be true, with the specified number of
+# max retries and delay between retries. Otherwise the 'elsescript' is
+# executed.
+proc wait_for_condition {maxtries delay e _else_ elsescript} {
+    while {[incr maxtries -1] >= 0} {
+        if {[uplevel 1 [list expr $e]]} break
+        after $delay
+    }
+    if {$maxtries == -1} {
+        uplevel 1 $elsescript
+    }
 }
 
 # Test if TERM looks like to support colors

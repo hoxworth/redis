@@ -1,6 +1,6 @@
 /* anet.c -- Basic TCP socket stuff made a bit less boring
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -61,7 +61,7 @@ int anetNonBlock(char *err, int fd)
 {
     int flags;
 
-    /* Set the socket nonblocking.
+    /* Set the socket non-blocking.
      * Note that fcntl(2) for F_GETFL and F_SETFL can't be
      * interrupted by a signal. */
     if ((flags = fcntl(fd, F_GETFL)) == -1) {
@@ -75,16 +75,73 @@ int anetNonBlock(char *err, int fd)
     return ANET_OK;
 }
 
-int anetTcpNoDelay(char *err, int fd)
+/* Set TCP keep alive option to detect dead peers. The interval option
+ * is only used for Linux as we are using Linux-specific APIs to set
+ * the probe send time, interval, and count. */
+int anetKeepAlive(char *err, int fd, int interval)
 {
-    int yes = 1;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) == -1)
+    int val = 1;
+
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val)) == -1)
+    {
+        anetSetError(err, "setsockopt SO_KEEPALIVE: %s", strerror(errno));
+        return ANET_ERR;
+    }
+
+#ifdef __linux__
+    /* Default settings are more or less garbage, with the keepalive time
+     * set to 7200 by default on Linux. Modify settings to make the feature
+     * actually useful. */
+
+    /* Send first probe after interval. */
+    val = interval;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &val, sizeof(val)) < 0) {
+        anetSetError(err, "setsockopt TCP_KEEPIDLE: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+
+    /* Send next probes after the specified interval. Note that we set the
+     * delay as interval / 3, as we send three probes before detecting
+     * an error (see the next setsockopt call). */
+    val = interval/3;
+    if (val == 0) val = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &val, sizeof(val)) < 0) {
+        anetSetError(err, "setsockopt TCP_KEEPINTVL: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+
+    /* Consider the socket in error state after three we send three ACK
+     * probes without getting a reply. */
+    val = 3;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &val, sizeof(val)) < 0) {
+        anetSetError(err, "setsockopt TCP_KEEPCNT: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+#endif
+
+    return ANET_OK;
+}
+
+static int anetSetTcpNoDelay(char *err, int fd, int val)
+{
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)) == -1)
     {
         anetSetError(err, "setsockopt TCP_NODELAY: %s", strerror(errno));
         return ANET_ERR;
     }
     return ANET_OK;
 }
+
+int anetEnableTcpNoDelay(char *err, int fd)
+{
+    return anetSetTcpNoDelay(err, fd, 1);
+}
+
+int anetDisableTcpNoDelay(char *err, int fd) 
+{
+    return anetSetTcpNoDelay(err, fd, 0);
+}
+
 
 int anetSetSendBuffer(char *err, int fd, int buffsize)
 {
@@ -132,7 +189,7 @@ static int anetCreateSocket(char *err, int domain) {
         return ANET_ERR;
     }
 
-    /* Make sure connection-intensive things like the redis benckmark
+    /* Make sure connection-intensive things like the redis benchmark
      * will be able to close/open sockets a zillion of times */
     if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == -1) {
         anetSetError(err, "setsockopt SO_REUSEADDR: %s", strerror(errno));
@@ -262,7 +319,11 @@ static int anetListen(char *err, int s, struct sockaddr *sa, socklen_t len) {
         close(s);
         return ANET_ERR;
     }
-    if (listen(s, 511) == -1) { /* the magic 511 constant is from nginx */
+
+    /* Use a backlog of 512 entries. We pass 511 to the listen() call because
+     * the kernel does: backlogsize = roundup_pow_of_two(backlogsize + 1);
+     * which will thus give us a backlog of 512 entries */
+    if (listen(s, 511) == -1) {
         anetSetError(err, "listen: %s", strerror(errno));
         close(s);
         return ANET_ERR;
@@ -354,6 +415,21 @@ int anetPeerToString(int fd, char *ip, int *port) {
     socklen_t salen = sizeof(sa);
 
     if (getpeername(fd,(struct sockaddr*)&sa,&salen) == -1) {
+        *port = 0;
+        ip[0] = '?';
+        ip[1] = '\0';
+        return -1;
+    }
+    if (ip) strcpy(ip,inet_ntoa(sa.sin_addr));
+    if (port) *port = ntohs(sa.sin_port);
+    return 0;
+}
+
+int anetSockName(int fd, char *ip, int *port) {
+    struct sockaddr_in sa;
+    socklen_t salen = sizeof(sa);
+
+    if (getsockname(fd,(struct sockaddr*)&sa,&salen) == -1) {
         *port = 0;
         ip[0] = '?';
         ip[1] = '\0';

@@ -1,3 +1,32 @@
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "redis.h"
 
 #include <signal.h>
@@ -10,34 +39,12 @@ void SlotToKeyDel(robj *key);
  * C-level DB API
  *----------------------------------------------------------------------------*/
 
-/* Important notes on lookup and disk store.
- *
- * When disk store is enabled on lookup we can have different cases.
- *
- * a) The key is in memory:
- *    - If the key is not in IO_SAVEINPROG state we can access it.
- *      As if it's just IO_SAVE this means we have the key in the IO queue
- *      but can't be accessed by the IO thread (it requires to be
- *      translated into an IO Job by the cache cron function.)
- *    - If the key is in IO_SAVEINPROG we can't touch the key and have
- *      to blocking wait completion of operations.
- * b) The key is not in memory:
- *    - If it's marked as non existing on disk as well (negative cache)
- *      we don't need to perform the disk access.
- *    - if the key MAY EXIST, but is not in memory, and it is marked as IO_SAVE
- *      then the key can only be a deleted one. As IO_SAVE keys are never
- *      evicted (dirty state), so the only possibility is that key was deleted.
- *    - if the key MAY EXIST we need to blocking load it.
- *      We check that the key is not in IO_SAVEINPROG state before accessing
- *      the disk object. If it is in this state, we wait.
- */
-
 robj *lookupKey(redisDb *db, robj *key) {
     dictEntry *de = dictFind(db->dict,key->ptr);
     if (de) {
         robj *val = dictGetVal(de);
 
-        /* Update the access time for the aging algorithm.
+        /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
         if (server.rdb_child_pid == -1 && server.aof_child_pid == -1)
@@ -78,7 +85,7 @@ robj *lookupKeyWriteOrReply(redisClient *c, robj *key, robj *reply) {
 }
 
 /* Add the key to the DB. It's up to the caller to increment the reference
- * counte of the value if needed.
+ * counter of the value if needed.
  *
  * The program is aborted if the key already exists. */
 void dbAdd(redisDb *db, robj *key, robj *val) {
@@ -159,8 +166,6 @@ int dbDelete(redisDb *db, robj *key) {
     }
 }
 
-/* Empty the whole database.
- * If diskstore is enabled this function will just flush the in-memory cache. */
 long long emptyDb() {
     int j;
     long long removed = 0;
@@ -214,7 +219,7 @@ void flushallCommand(redisClient *c) {
     server.dirty += emptyDb();
     addReply(c,shared.ok);
     if (server.rdb_child_pid != -1) {
-        kill(server.rdb_child_pid,SIGKILL);
+        kill(server.rdb_child_pid,SIGUSR1);
         rdbRemoveTempFile(server.rdb_child_pid);
     }
     if (server.saveparamslen > 0) {
@@ -250,7 +255,11 @@ void existsCommand(redisClient *c) {
 }
 
 void selectCommand(redisClient *c) {
-    int id = atoi(c->argv[1]->ptr);
+    long id;
+
+    if (getLongFromObjectOrReply(c, c->argv[1], &id,
+        "invalid DB index") != REDIS_OK)
+        return;
 
     if (selectDb(c,id) == REDIS_ERR) {
         addReplyError(c,"invalid DB index");
@@ -279,7 +288,7 @@ void keysCommand(redisClient *c) {
     unsigned long numkeys = 0;
     void *replylen = addDeferredMultiBulkLength(c);
 
-    di = dictGetIterator(c->db->dict);
+    di = dictGetSafeIterator(c->db->dict);
     allkeys = (pattern[0] == '*' && pattern[1] == '\0');
     while((de = dictNext(di)) != NULL) {
         sds key = dictGetKey(de);
@@ -507,7 +516,7 @@ int expireIfNeeded(redisDb *db, robj *key) {
      * that is, 0 if we think the key should be still valid, 1 if
      * we think the key is expired at this time. */
     if (server.masterhost != NULL) {
-        return time(NULL) > when;
+        return mstime() > when;
     }
 
     /* Return when this key has not expired */
@@ -523,37 +532,36 @@ int expireIfNeeded(redisDb *db, robj *key) {
  * Expires Commands
  *----------------------------------------------------------------------------*/
 
-/* Given an string object return true if it contains exactly the "ms"
- * or "MS" string. This is used in order to check if the last argument
- * of EXPIRE, EXPIREAT or TTL is "ms" to switch into millisecond input/output */
-int stringObjectEqualsMs(robj *a) {
-    char *arg = a->ptr;
-    return tolower(arg[0]) == 'm' && tolower(arg[1]) == 's' && arg[2] == '\0';
-}
-
-void expireGenericCommand(redisClient *c, long long offset, int unit) {
-    dictEntry *de;
+/* This is the generic command implementation for EXPIRE, PEXPIRE, EXPIREAT
+ * and PEXPIREAT. Because the commad second argument may be relative or absolute
+ * the "basetime" argument is used to signal what the base time is (either 0
+ * for *AT variants of the command, or the current time for relative expires).
+ *
+ * unit is either UNIT_SECONDS or UNIT_MILLISECONDS, and is only used for
+ * the argv[2] parameter. The basetime is always specified in milliseconds. */
+void expireGenericCommand(redisClient *c, long long basetime, int unit) {
     robj *key = c->argv[1], *param = c->argv[2];
-    long long milliseconds;
+    long long when; /* unix time in milliseconds when the key will expire. */
 
-    if (getLongLongFromObjectOrReply(c, param, &milliseconds, NULL) != REDIS_OK)
+    if (getLongLongFromObjectOrReply(c, param, &when, NULL) != REDIS_OK)
         return;
 
-    if (unit == UNIT_SECONDS) milliseconds *= 1000;
-    milliseconds -= offset;
+    if (unit == UNIT_SECONDS) when *= 1000;
+    when += basetime;
 
-    de = dictFind(c->db->dict,key->ptr);
-    if (de == NULL) {
+    /* No key, return zero. */
+    if (lookupKeyRead(c->db,key) == NULL) {
         addReply(c,shared.czero);
         return;
     }
+
     /* EXPIRE with negative TTL, or EXPIREAT with a timestamp into the past
      * should never be executed as a DEL when load the AOF or in the context
      * of a slave instance.
      *
      * Instead we take the other branch of the IF statement setting an expire
      * (possibly in the past) and wait for an explicit DEL from the master. */
-    if (milliseconds <= 0 && !server.loading && !server.masterhost) {
+    if (when <= mstime() && !server.loading && !server.masterhost) {
         robj *aux;
 
         redisAssertWithInfo(c,key,dbDelete(c->db,key));
@@ -567,7 +575,6 @@ void expireGenericCommand(redisClient *c, long long offset, int unit) {
         addReply(c, shared.cone);
         return;
     } else {
-        long long when = mstime()+milliseconds;
         setExpire(c->db,key,when);
         addReply(c,shared.cone);
         signalModifiedKey(c->db,key);
@@ -577,19 +584,19 @@ void expireGenericCommand(redisClient *c, long long offset, int unit) {
 }
 
 void expireCommand(redisClient *c) {
-    expireGenericCommand(c,0,UNIT_SECONDS);
-}
-
-void expireatCommand(redisClient *c) {
     expireGenericCommand(c,mstime(),UNIT_SECONDS);
 }
 
+void expireatCommand(redisClient *c) {
+    expireGenericCommand(c,0,UNIT_SECONDS);
+}
+
 void pexpireCommand(redisClient *c) {
-    expireGenericCommand(c,0,UNIT_MILLISECONDS);
+    expireGenericCommand(c,mstime(),UNIT_MILLISECONDS);
 }
 
 void pexpireatCommand(redisClient *c) {
-    expireGenericCommand(c,mstime(),UNIT_MILLISECONDS);
+    expireGenericCommand(c,0,UNIT_MILLISECONDS);
 }
 
 void ttlGenericCommand(redisClient *c, int output_ms) {

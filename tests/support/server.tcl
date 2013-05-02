@@ -17,7 +17,7 @@ proc check_valgrind_errors stderr {
     set buf [read $fd]
     close $fd
 
-    if {![regexp -- {ERROR SUMMARY: 0 errors} $buf] ||
+    if {[regexp -- { at 0x} $buf] ||
         (![regexp -- {definitely lost: 0 bytes} $buf] &&
          ![regexp -- {no leaks are possible} $buf])} {
         send_data_packet $::test_server_fd err "Valgrind error: $buf\n"
@@ -38,7 +38,9 @@ proc kill_server config {
             if {[string match {*Darwin*} [exec uname -a]]} {
                 tags {"leaks"} {
                     test "Check for memory leaks (pid $pid)" {
-                        exec leaks $pid
+                        set output {0 leaks}
+                        catch {exec leaks $pid} output
+                        set output
                     } {*0 leaks*}
                 }
             }
@@ -46,11 +48,16 @@ proc kill_server config {
     }
 
     # kill server and wait for the process to be totally exited
+    catch {exec kill $pid}
     while {[is_alive $config]} {
-        if {[incr wait 10] % 1000 == 0} {
+        incr wait 10
+
+        if {$wait >= 5000} {
+            puts "Forcing process $pid to exit..."
+            catch {exec kill -KILL $pid}
+        } elseif {$wait % 1000 == 0} {
             puts "Waiting for process $pid to exit..."
         }
-        catch {exec kill $pid}
         after 10
     }
 
@@ -102,7 +109,7 @@ proc tags {tags code} {
 }
 
 proc start_server {options {code undefined}} {
-    # If we are runnign against an external server, we just push the
+    # If we are running against an external server, we just push the
     # host/port pair in the stack the first time
     if {$::external} {
         if {[llength $::servers] == 0} {
@@ -247,7 +254,7 @@ proc start_server {options {code undefined}} {
 
         while 1 {
             # check that the server actually started and is ready for connections
-            if {[exec cat $stdout | grep "ready to accept" | wc -l] > 0} {
+            if {[exec grep "ready to accept" | wc -l < $stdout] > 0} {
                 break
             }
             after 10

@@ -7,7 +7,7 @@ start_server {
 } {
     source "tests/unit/type/list-common.tcl"
 
-    test {LPUSH, RPUSH, LLENGTH, LINDEX - ziplist} {
+    test {LPUSH, RPUSH, LLENGTH, LINDEX, LPOP - ziplist} {
         # first lpush then rpush
         assert_equal 1 [r lpush myziplist1 a]
         assert_equal 2 [r rpush myziplist1 b]
@@ -16,6 +16,9 @@ start_server {
         assert_equal a [r lindex myziplist1 0]
         assert_equal b [r lindex myziplist1 1]
         assert_equal c [r lindex myziplist1 2]
+        assert_equal {} [r lindex myziplist2 3]
+        assert_equal c [r rpop myziplist1]
+        assert_equal a [r lpop myziplist1]
         assert_encoding ziplist myziplist1
 
         # first rpush then lpush
@@ -26,10 +29,13 @@ start_server {
         assert_equal c [r lindex myziplist2 0]
         assert_equal b [r lindex myziplist2 1]
         assert_equal a [r lindex myziplist2 2]
+        assert_equal {} [r lindex myziplist2 3]
+        assert_equal a [r rpop myziplist2]
+        assert_equal c [r lpop myziplist2]
         assert_encoding ziplist myziplist2
     }
 
-    test {LPUSH, RPUSH, LLENGTH, LINDEX - regular list} {
+    test {LPUSH, RPUSH, LLENGTH, LINDEX, LPOP - regular list} {
         # first lpush then rpush
         assert_equal 1 [r lpush mylist1 $largevalue(linkedlist)]
         assert_encoding linkedlist mylist1
@@ -39,6 +45,9 @@ start_server {
         assert_equal $largevalue(linkedlist) [r lindex mylist1 0]
         assert_equal b [r lindex mylist1 1]
         assert_equal c [r lindex mylist1 2]
+        assert_equal {} [r lindex mylist1 3]
+        assert_equal c [r rpop mylist1]
+        assert_equal $largevalue(linkedlist) [r lpop mylist1]
 
         # first rpush then lpush
         assert_equal 1 [r rpush mylist2 $largevalue(linkedlist)]
@@ -49,7 +58,14 @@ start_server {
         assert_equal c [r lindex mylist2 0]
         assert_equal b [r lindex mylist2 1]
         assert_equal $largevalue(linkedlist) [r lindex mylist2 2]
+        assert_equal {} [r lindex mylist2 3]
+        assert_equal $largevalue(linkedlist) [r rpop mylist2]
+        assert_equal c [r lpop mylist2]
     }
+
+    test {R/LPOP against empty list} {
+        r lpop non-existing-list
+    } {}
 
     test {Variadic RPUSH/LPUSH} {
         r del mylist
@@ -145,6 +161,68 @@ start_server {
         }
     }
 
+    test "BLPOP, LPUSH + DEL should not awake blocked client" {
+        set rd [redis_deferring_client]
+        r del list
+
+        $rd blpop list 0
+        r multi
+        r lpush list a
+        r del list
+        r exec
+        r del list
+        r lpush list b
+        $rd read
+    } {list b}
+
+    test "BLPOP, LPUSH + DEL + SET should not awake blocked client" {
+        set rd [redis_deferring_client]
+        r del list
+
+        $rd blpop list 0
+        r multi
+        r lpush list a
+        r del list
+        r set list foo
+        r exec
+        r del list
+        r lpush list b
+        $rd read
+    } {list b}
+
+    test "BLPOP with same key multiple times should work (issue #801)" {
+        set rd [redis_deferring_client]
+        r del list1 list2
+
+        # Data arriving after the BLPOP.
+        $rd blpop list1 list2 list2 list1 0
+        r lpush list1 a
+        assert_equal [$rd read] {list1 a}
+        $rd blpop list1 list2 list2 list1 0
+        r lpush list2 b
+        assert_equal [$rd read] {list2 b}
+
+        # Data already there.
+        r lpush list1 a
+        r lpush list2 b
+        $rd blpop list1 list2 list2 list1 0
+        assert_equal [$rd read] {list1 a}
+        $rd blpop list1 list2 list2 list1 0
+        assert_equal [$rd read] {list2 b}
+    }
+
+    test "MULTI/EXEC is isolated from the point of view of BLPOP" {
+        set rd [redis_deferring_client]
+        r del list
+        $rd blpop list 0
+        r multi
+        r lpush list a
+        r lpush list b
+        r lpush list c
+        r exec
+        $rd read
+    } {list c}
+
     test "BLPOP with variadic LPUSH" {
         set rd [redis_deferring_client]
         r del blist target
@@ -153,8 +231,8 @@ start_server {
         if {$::valgrind} {after 100}
         assert_equal 2 [r lpush blist foo bar]
         if {$::valgrind} {after 100}
-        assert_equal {blist foo} [$rd read]
-        assert_equal bar [lindex [r lrange blist 0 -1] 0]
+        assert_equal {blist bar} [$rd read]
+        assert_equal foo [lindex [r lrange blist 0 -1] 0]
     }
 
     test "BRPOPLPUSH with zero timeout should block indefinitely" {
@@ -205,6 +283,16 @@ start_server {
         assert_error "ERR*wrong kind*" {$rd read}
         assert_equal {foo} [r lrange blist 0 -1]
     }
+
+    test "BRPOPLPUSH maintains order of elements after failure" {
+        set rd [redis_deferring_client]
+        r del blist target
+        r set target nolist
+        $rd brpoplpush blist target 0
+        r rpush blist a b c
+        assert_error "ERR*wrong kind*" {$rd read}
+        r lrange blist 0 -1
+    } {a b c}
 
     test "BRPOPLPUSH with multiple blocked clients" {
         set rd1 [redis_deferring_client]
@@ -276,6 +364,41 @@ start_server {
         r lrange target 0 -1
         r exec
     } {foo bar {} {} {bar foo}}
+
+    test "PUSH resulting from BRPOPLPUSH affect WATCH" {
+        set blocked_client [redis_deferring_client]
+        set watching_client [redis_deferring_client]
+        r del srclist dstlist somekey
+        r set somekey somevalue
+        $blocked_client brpoplpush srclist dstlist 0
+        $watching_client watch dstlist
+        $watching_client read
+        $watching_client multi
+        $watching_client read
+        $watching_client get somekey
+        $watching_client read
+        r lpush srclist element
+        $watching_client exec
+        $watching_client read
+    } {}
+
+    test "BRPOPLPUSH does not affect WATCH while still blocked" {
+        set blocked_client [redis_deferring_client]
+        set watching_client [redis_deferring_client]
+        r del srclist dstlist somekey
+        r set somekey somevalue
+        $blocked_client brpoplpush srclist dstlist 0
+        $watching_client watch dstlist
+        $watching_client read
+        $watching_client multi
+        $watching_client read
+        $watching_client get somekey
+        $watching_client read
+        $watching_client exec
+        # Blocked BLPOPLPUSH may create problems, unblock it.
+        r lpush srclist element
+        $watching_client read
+    } {somevalue}
 
     test {BRPOPLPUSH timeout} {
       set rd [redis_deferring_client]
@@ -395,6 +518,11 @@ start_server {
             assert_equal 42 [r lrange xlist 0 0]
         }
     }
+
+    test {LINSERT raise error on bad syntax} {
+        catch {[r linsert xlist aft3r aa 42]} e
+        set e
+    } {*ERR*syntax*error*}
 
     test {LPUSHX, RPUSHX convert from ziplist to list} {
         set large $largevalue(linkedlist)

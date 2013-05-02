@@ -141,4 +141,43 @@ start_server {tags {"expire"}} {
         set size2 [r dbsize]
         list $size1 $size2
     } {3 0}
+
+    test {Redis should lazy expire keys} {
+        r flushdb
+        r debug set-active-expire 0
+        r psetex key1 500 a
+        r psetex key2 500 a
+        r psetex key3 500 a
+        set size1 [r dbsize]
+        # Redis expires random keys ten times every second so we are
+        # fairly sure that all the three keys should be evicted after
+        # one second.
+        after 1000
+        set size2 [r dbsize]
+        r mget key1 key2 key3
+        set size3 [r dbsize]
+        r debug set-active-expire 1
+        list $size1 $size2 $size3
+    } {3 3 0}
+
+    test {EXPIRE should not resurrect keys (issue #1026)} {
+        r debug set-active-expire 0
+        r set foo bar
+        r pexpire foo 500
+        after 1000
+        r expire foo 10
+        r debug set-active-expire 1
+        r exists foo
+    } {0}
+
+    test {5 keys in, 5 keys out} {
+        r flushdb
+        r set a c
+        r expire a 5
+        r set t c
+        r set e c
+        r set s c
+        r set foo b
+        lsort [r keys *]
+    } {a e foo s t}
 }

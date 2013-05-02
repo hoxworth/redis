@@ -1,6 +1,6 @@
 /* anet.c -- Basic TCP socket stuff made a bit less boring
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -51,8 +51,10 @@ int anetTcpAccept(char *err, int serversock, char *ip, int *port);
 int anetUnixAccept(char *err, int serversock);
 int anetWrite(int fd, char *buf, int count);
 int anetNonBlock(char *err, int fd);
-int anetTcpNoDelay(char *err, int fd);
+int anetEnableTcpNoDelay(char *err, int fd);
+int anetDisableTcpNoDelay(char *err, int fd);
 int anetTcpKeepAlive(char *err, int fd);
 int anetPeerToString(int fd, char *ip, int *port);
+int anetKeepAlive(char *err, int fd, int interval);
 
 #endif
