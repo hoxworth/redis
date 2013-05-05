@@ -25,6 +25,15 @@ proc assert_equal {expected value} {
     }
 }
 
+proc assert_equal_elements {expected value} {
+    if {[llength $expected] ne [llength $value]} {
+        error "assertion: '$value' does not contain the same members as '$expected'"
+    }
+    if {[lsort $expected] ne [lsort $value]} {
+        error "assertion: '$value' does not contain the same members as '$expected'"
+    }
+}
+
 proc assert_error {pattern code} {
     if {[catch {uplevel 1 $code} error]} {
         assert_match $pattern $error
